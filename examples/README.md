@@ -3,7 +3,6 @@
 Examples for common OpenSandbox use cases. Each subdirectory contains runnable code and documentation.
 
 ## Integrations / Sandboxes
-- [**echo**](echo): Minimal example using Ubuntu image to execute a simple echo command
 - [**aio-sandbox**](aio-sandbox): Basic example for agent_sandbox
 - [**code-interpreter**](code-interpreter): Code Interpreter SDK singleton example
 - [**claude-code**](claude-code): Call Claude (Anthropic) API/CLI within the sandbox
