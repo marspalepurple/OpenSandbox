@@ -81,6 +81,7 @@ type BatchSandboxReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/reconcile
 func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var aggErrors []error
 	defer func() {
 		_ = DurationStore.Pop(req.String())
 	}()
@@ -131,59 +132,62 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
-	var aggErrors []error
-
 	pods, err := r.listPods(ctx, batchSbx)
 	if err != nil {
-		aggErrors = append(aggErrors, err)
-	} else {
-		slices.SortStableFunc[[]*corev1.Pod, *corev1.Pod](pods, utils.PodNameSorter)
-		var err error
-		// Normal Mode need scale Pods
-		if batchSbx.Spec.Template != nil {
-			err = r.scaleBatchSandbox(ctx, batchSbx, batchSbx.Spec.Template, pods)
-		}
+		return ctrl.Result{}, fmt.Errorf("failed to list pods %w", err)
+	}
+	podIndex, err := calPodIndex(batchSbx, pods)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to cal pod index %w", err)
+	}
+	slices.SortStableFunc(pods, utils.MultiPodSorter([]func(a, b *corev1.Pod) int{
+		utils.WithPodIndexSorter(podIndex),
+		utils.PodNameSorter,
+	}).Sort)
+	// Normal Mode need scale Pods
+	if batchSbx.Spec.Template != nil {
+		err := r.scaleBatchSandbox(ctx, batchSbx, batchSbx.Spec.Template, pods)
 		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to scale batch sandbox %w", err)
+		}
+	}
+
+	// TODO merge task status update
+	newStatus := batchSbx.Status.DeepCopy()
+	newStatus.ObservedGeneration = batchSbx.Generation
+	newStatus.Replicas = 0
+	newStatus.Allocated = 0
+	newStatus.Ready = 0
+	ipList := make([]string, len(pods))
+	for i, pod := range pods {
+		newStatus.Replicas++
+		if utils.IsAssigned(pod) {
+			newStatus.Allocated++
+			ipList[i] = pod.Status.PodIP
+		}
+		if pod.Status.Phase == corev1.PodRunning && utils.IsPodReady(pod) {
+			newStatus.Ready++
+		}
+	}
+	raw, _ := json.Marshal(ipList)
+	if batchSbx.Annotations[AnnotationSandboxEndpoints] != string(raw) {
+		patchData, _ := json.Marshal(map[string]any{
+			"metadata": map[string]any{
+				"annotations": map[string]string{
+					AnnotationSandboxEndpoints: string(raw),
+				},
+			},
+		})
+		obj := &sandboxv1alpha1.BatchSandbox{ObjectMeta: metav1.ObjectMeta{Namespace: batchSbx.Namespace, Name: batchSbx.Name}}
+		if err := r.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchData)); err != nil {
+			klog.Errorf("failed to patch annotation %s, %s, body %s", AnnotationSandboxEndpoints, klog.KObj(batchSbx), patchData)
 			aggErrors = append(aggErrors, err)
 		}
-
-		// TODO merge task status update
-		newStatus := batchSbx.Status.DeepCopy()
-		newStatus.ObservedGeneration = batchSbx.Generation
-		newStatus.Replicas = 0
-		newStatus.Allocated = 0
-		newStatus.Ready = 0
-		ipList := []string{}
-		for _, pod := range pods {
-			newStatus.Replicas++
-			if utils.IsAssigned(pod) {
-				newStatus.Allocated++
-				ipList = append(ipList, pod.Status.PodIP)
-			}
-			if pod.Status.Phase == corev1.PodRunning && utils.IsPodReady(pod) {
-				newStatus.Ready++
-			}
-		}
-		raw, _ := json.Marshal(ipList)
-		if batchSbx.Annotations[AnnotationSandboxEndpoints] != string(raw) {
-			patchData, _ := json.Marshal(map[string]interface{}{
-				"metadata": map[string]interface{}{
-					"annotations": map[string]string{
-						AnnotationSandboxEndpoints: string(raw),
-					},
-				},
-			})
-			obj := &sandboxv1alpha1.BatchSandbox{ObjectMeta: metav1.ObjectMeta{Namespace: batchSbx.Namespace, Name: batchSbx.Name}}
-			if err := r.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchData)); err != nil {
-				klog.Errorf("failed to patch annotation %s, %s, body %s", AnnotationSandboxEndpoints, klog.KObj(batchSbx), patchData)
-				aggErrors = append(aggErrors, err)
-			}
-		}
-		if !reflect.DeepEqual(newStatus, batchSbx.Status) {
-			klog.Infof("To update BatchSandbox status for %s, replicas=%d allocated=%d ready=%d", klog.KObj(batchSbx), newStatus.Replicas, newStatus.Allocated, newStatus.Ready)
-			if err := r.updateStatus(batchSbx, newStatus); err != nil {
-				aggErrors = append(aggErrors, err)
-			}
+	}
+	if !reflect.DeepEqual(newStatus, batchSbx.Status) {
+		klog.Infof("To update BatchSandbox status for %s, replicas=%d allocated=%d ready=%d", klog.KObj(batchSbx), newStatus.Replicas, newStatus.Allocated, newStatus.Ready)
+		if err := r.updateStatus(batchSbx, newStatus); err != nil {
+			aggErrors = append(aggErrors, err)
 		}
 	}
 
@@ -203,8 +207,7 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 		now := time.Now()
 		if err = r.scheduleTasks(ctx, sch, batchSbx); err != nil {
-			klog.Errorf("BatchSandbox %s failed to schedule tasks, err %v", klog.KObj(batchSbx), err)
-			aggErrors = append(aggErrors, err)
+			return ctrl.Result{}, fmt.Errorf("failed to schedule tasks, err %w", err)
 		} else {
 			klog.Infof("BatchSandbox %s schedule tasks cost %d ms", klog.KObj(batchSbx), time.Since(now).Milliseconds())
 		}
@@ -235,6 +238,30 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	return reconcile.Result{RequeueAfter: DurationStore.Pop(req.String())}, gerrors.Join(aggErrors...)
+}
+
+func calPodIndex(batchSbx *sandboxv1alpha1.BatchSandbox, pods []*corev1.Pod) (map[string]int, error) {
+	podIndex := map[string]int{}
+	if batchSbx.Spec.PoolRef != "" {
+		// cal index from pool alloc result while using pooling
+		alloc, err := parseSandboxAllocation(batchSbx)
+		if err != nil {
+			return nil, err
+		}
+		for i := range alloc.Pods {
+			podIndex[alloc.Pods[i]] = i
+		}
+	} else {
+		for i := range pods {
+			po := pods[i]
+			idx, err := parseIndex(po)
+			if err != nil {
+				return nil, fmt.Errorf("batchsandbox: failed to parse %s index %w", klog.KObj(po), err)
+			}
+			podIndex[po.Name] = idx
+		}
+	}
+	return podIndex, nil
 }
 
 func (r *BatchSandboxReconciler) listPods(ctx context.Context, batchSbx *sandboxv1alpha1.BatchSandbox) ([]*corev1.Pod, error) {
