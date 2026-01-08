@@ -180,3 +180,37 @@ func PodNameSorter(a, b *v1.Pod) int {
 	}
 	return 0
 }
+
+func WithPodIndexSorter(podIndex map[string]int) func(*v1.Pod, *v1.Pod) int {
+	return func(a, b *v1.Pod) int {
+		aIdx, aOk := podIndex[a.Name]
+		bIdx, bOk := podIndex[b.Name]
+		if !aOk && !bOk {
+			return 0
+		}
+		if !aOk {
+			return 1
+		}
+		if !bOk {
+			return -1
+		}
+		if aIdx < bIdx {
+			return -1
+		} else if aIdx > bIdx {
+			return 1
+		}
+		return 0
+	}
+}
+
+type MultiPodSorter []func(a, b *v1.Pod) int
+
+func (m MultiPodSorter) Sort(a, b *v1.Pod) int {
+	for i := range m {
+		ret := m[i](a, b)
+		if ret != 0 {
+			return ret
+		}
+	}
+	return 0
+}

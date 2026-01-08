@@ -86,7 +86,7 @@ var _ = Describe("BatchSandbox Controller", func() {
 					Namespace: typeNamespacedName.Namespace,
 				},
 				Spec: sandboxv1alpha1.BatchSandboxSpec{
-					Replicas: ptr.To(int32(1)),
+					Replicas: ptr.To(int32(3)),
 					Template: &v1.PodTemplateSpec{
 						Spec: v1.PodSpec{
 							Containers: []v1.Container{
@@ -120,6 +120,7 @@ var _ = Describe("BatchSandbox Controller", func() {
 		})
 		It("should successfully create pod, update batch sandbox status, endpoints info", func() {
 			wantIPSet := make(set.Set[string])
+			podIPMap := make(map[string]string)
 			Eventually(func(g Gomega) {
 				bs := &sandboxv1alpha1.BatchSandbox{}
 				if err := k8sClient.Get(ctx, typeNamespacedName, bs); err != nil {
@@ -135,26 +136,39 @@ var _ = Describe("BatchSandbox Controller", func() {
 						if po.Status.PodIP != "" {
 							continue
 						}
-						// patch status to make pod Scheduled
-						mockIP := randomIPv4().String()
-						wantIPSet.Insert(mockIP)
-						po.Status.PodIP = mockIP
-						po.Status.Phase = corev1.PodRunning
-						po.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
-						Expect(k8sClient.Status().Update(context.Background(), po)).To(Succeed())
+						if i%2 == 0 {
+							mockIP := randomIPv4().String()
+							wantIPSet.Insert(mockIP)
+							podIPMap[po.Name] = mockIP
+							po.Status.PodIP = mockIP
+							po.Status.Phase = corev1.PodRunning
+							po.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+							Expect(k8sClient.Status().Update(context.Background(), po)).To(Succeed())
+						}
 					}
 				}
 				g.Expect(len(pods)).To(Equal(int(*bs.Spec.Replicas)))
 				g.Expect(bs.Status.ObservedGeneration).To(Equal(bs.Generation))
 				g.Expect(bs.Status.Replicas).To(Equal(*bs.Spec.Replicas))
-				g.Expect(bs.Status.Allocated).To(Equal(*bs.Spec.Replicas))
-				g.Expect(bs.Status.Ready).To(Equal(*bs.Spec.Replicas))
 
 				gotIPs := []string{}
 				if raw := bs.Annotations[AnnotationSandboxEndpoints]; raw != "" {
 					json.Unmarshal([]byte(raw), &gotIPs)
 				}
-				g.Expect(wantIPSet.Equal(set.New(gotIPs...))).To(BeTrue(), fmt.Sprintf("wantIPSet %v, gotIPs %v", wantIPSet.SortedList(), gotIPs))
+
+				podIndex, err := calPodIndex(bs, pods)
+				g.Expect(err).NotTo(HaveOccurred())
+				expectedIPs := make([]string, len(pods))
+				for _, pod := range pods {
+					idx, ok := podIndex[pod.Name]
+					g.Expect(ok).To(BeTrue(), fmt.Sprintf("pod %s should have index", pod.Name))
+					if pod.Status.PodIP != "" {
+						expectedIPs[idx] = pod.Status.PodIP
+					} else {
+						expectedIPs[idx] = ""
+					}
+				}
+				g.Expect(gotIPs).To(Equal(expectedIPs), "endpoints should be ordered by pod index, unassigned pods should have empty string")
 			}, timeout, interval).Should(Succeed())
 		})
 		It("should successfully correctly create new Pod and update batch sandbox status when user scale out", func() {
@@ -243,7 +257,7 @@ var _ = Describe("BatchSandbox Controller", func() {
 	// Pooling Mode
 	Context("When create new batch sandbox, get pod from pool", func() {
 		const resourceBaseName = "test-batch-sandbox-pooling-mode"
-		var replicas int32 = 1
+		var replicas int32 = 3
 		ctx := context.Background()
 
 		typeNamespacedName := types.NamespacedName{
@@ -294,14 +308,16 @@ var _ = Describe("BatchSandbox Controller", func() {
 						Containers: []v1.Container{
 							{Name: "main", Image: "test", Command: []string{"hello"}},
 						},
-						NodeName: "node-1.2.3.4",
 					},
 				}
 				mockPods = append(mockPods, po.Name)
 				Expect(k8sClient.Create(context.Background(), po)).To(Succeed())
-				po.Status.PodIP = "1.2.3.4"
-				po.Status.Phase = corev1.PodRunning
-				po.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+				if i%2 == 0 {
+					po.Spec.NodeName = "node-1.2.3.4"
+					po.Status.PodIP = fmt.Sprintf("1.2.3.%d", i+1)
+					po.Status.Phase = corev1.PodRunning
+					po.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+				}
 				Expect(k8sClient.Status().Update(context.Background(), po)).To(Succeed())
 			}
 			Expect(retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -321,10 +337,26 @@ var _ = Describe("BatchSandbox Controller", func() {
 				}
 				g.Expect(bs.Status.ObservedGeneration).To(Equal(bs.Generation))
 				g.Expect(bs.Status.Replicas).To(Equal(*bs.Spec.Replicas))
-				g.Expect(bs.Status.Allocated).To(Equal(*bs.Spec.Replicas))
-				g.Expect(bs.Status.Ready).To(Equal(*bs.Spec.Replicas))
 
-				g.Expect(bs.Annotations[AnnotationSandboxEndpoints]).To(Equal("[\"1.2.3.4\"]"))
+				gotIPs := []string{}
+				if raw := bs.Annotations[AnnotationSandboxEndpoints]; raw != "" {
+					json.Unmarshal([]byte(raw), &gotIPs)
+				}
+
+				alloc, err := parseSandboxAllocation(bs)
+				g.Expect(err).NotTo(HaveOccurred())
+				expectedIPs := make([]string, len(alloc.Pods))
+				for idx, podName := range alloc.Pods {
+					pod := &corev1.Pod{}
+					err := k8sClient.Get(ctx, types.NamespacedName{Namespace: bs.Namespace, Name: podName}, pod)
+					g.Expect(err).NotTo(HaveOccurred())
+					if pod.Spec.NodeName != "" || pod.Status.PodIP != "" {
+						expectedIPs[idx] = pod.Status.PodIP
+					} else {
+						expectedIPs[idx] = ""
+					}
+				}
+				g.Expect(gotIPs).To(Equal(expectedIPs), "endpoints should be ordered by pool allocation order, unassigned pods should have empty string")
 			}, timeout, interval).Should(Succeed())
 		})
 	})
@@ -793,6 +825,247 @@ func Test_parseIndex(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("parseIndex() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_calPodIndex(t *testing.T) {
+	type args struct {
+		batchSbx *sandboxv1alpha1.BatchSandbox
+		pods     []*corev1.Pod
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    map[string]int
+		wantErr bool
+	}{
+		{
+			name: "pool mode - valid allocation",
+			args: args{
+				batchSbx: &sandboxv1alpha1.BatchSandbox{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-batch",
+						Namespace: "default",
+						Annotations: map[string]string{
+							AnnoAllocStatusKey: `{"pods":["pod-0","pod-1","pod-2"]}`,
+						},
+					},
+					Spec: sandboxv1alpha1.BatchSandboxSpec{
+						PoolRef: "test-pool",
+					},
+				},
+				pods: []*corev1.Pod{
+					{ObjectMeta: metav1.ObjectMeta{Name: "pod-0"}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "pod-1"}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "pod-2"}},
+				},
+			},
+			want: map[string]int{
+				"pod-0": 0,
+				"pod-1": 1,
+				"pod-2": 2,
+			},
+			wantErr: false,
+		},
+		{
+			name: "pool mode - allocation annotation missing",
+			args: args{
+				batchSbx: &sandboxv1alpha1.BatchSandbox{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-batch",
+						Namespace: "default",
+					},
+					Spec: sandboxv1alpha1.BatchSandboxSpec{
+						PoolRef: "test-pool",
+					},
+				},
+				pods: []*corev1.Pod{
+					{ObjectMeta: metav1.ObjectMeta{Name: "pod-0"}},
+				},
+			},
+			want:    map[string]int{},
+			wantErr: false,
+		},
+		{
+			name: "pool mode - invalid allocation json",
+			args: args{
+				batchSbx: &sandboxv1alpha1.BatchSandbox{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-batch",
+						Namespace: "default",
+						Annotations: map[string]string{
+							AnnoAllocStatusKey: `invalid-json`,
+						},
+					},
+					Spec: sandboxv1alpha1.BatchSandboxSpec{
+						PoolRef: "test-pool",
+					},
+				},
+				pods: []*corev1.Pod{},
+			},
+			want:    nil,
+			wantErr: true,
+		},
+		{
+			name: "pool mode - pods not in allocation list",
+			args: args{
+				batchSbx: &sandboxv1alpha1.BatchSandbox{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-batch",
+						Namespace: "default",
+						Annotations: map[string]string{
+							AnnoAllocStatusKey: `{"pods":["pod-0","pod-1"]}`,
+						},
+					},
+					Spec: sandboxv1alpha1.BatchSandboxSpec{
+						PoolRef: "test-pool",
+					},
+				},
+				pods: []*corev1.Pod{
+					{ObjectMeta: metav1.ObjectMeta{Name: "pod-0"}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "pod-1"}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "pod-2"}},
+				},
+			},
+			want: map[string]int{
+				"pod-0": 0,
+				"pod-1": 1,
+			},
+			wantErr: false,
+		},
+		{
+			name: "non-pool mode - parse from pod labels",
+			args: args{
+				batchSbx: &sandboxv1alpha1.BatchSandbox{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-batch",
+						Namespace: "default",
+					},
+					Spec: sandboxv1alpha1.BatchSandboxSpec{
+						Replicas: ptr.To(int32(3)),
+					},
+				},
+				pods: []*corev1.Pod{
+					{ObjectMeta: metav1.ObjectMeta{
+						Name:   "test-batch-0",
+						Labels: map[string]string{LabelBatchSandboxPodIndexKey: "0"},
+					}},
+					{ObjectMeta: metav1.ObjectMeta{
+						Name:   "test-batch-1",
+						Labels: map[string]string{LabelBatchSandboxPodIndexKey: "1"},
+					}},
+					{ObjectMeta: metav1.ObjectMeta{
+						Name:   "test-batch-2",
+						Labels: map[string]string{LabelBatchSandboxPodIndexKey: "2"},
+					}},
+				},
+			},
+			want: map[string]int{
+				"test-batch-0": 0,
+				"test-batch-1": 1,
+				"test-batch-2": 2,
+			},
+			wantErr: false,
+		},
+		{
+			name: "non-pool mode - parse from pod names",
+			args: args{
+				batchSbx: &sandboxv1alpha1.BatchSandbox{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-batch",
+						Namespace: "default",
+					},
+					Spec: sandboxv1alpha1.BatchSandboxSpec{
+						Replicas: ptr.To(int32(3)),
+					},
+				},
+				pods: []*corev1.Pod{
+					{ObjectMeta: metav1.ObjectMeta{Name: "test-batch-0"}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "test-batch-1"}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "test-batch-2"}},
+				},
+			},
+			want: map[string]int{
+				"test-batch-0": 0,
+				"test-batch-1": 1,
+				"test-batch-2": 2,
+			},
+			wantErr: false,
+		},
+		{
+			name: "non-pool mode - invalid pod name",
+			args: args{
+				batchSbx: &sandboxv1alpha1.BatchSandbox{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-batch",
+						Namespace: "default",
+					},
+					Spec: sandboxv1alpha1.BatchSandboxSpec{
+						Replicas: ptr.To(int32(1)),
+					},
+				},
+				pods: []*corev1.Pod{
+					{ObjectMeta: metav1.ObjectMeta{Name: "invalid-name-no-index"}},
+				},
+			},
+			want:    nil,
+			wantErr: true,
+		},
+		{
+			name: "non-pool mode - empty pods list",
+			args: args{
+				batchSbx: &sandboxv1alpha1.BatchSandbox{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-batch",
+						Namespace: "default",
+					},
+					Spec: sandboxv1alpha1.BatchSandboxSpec{
+						Replicas: ptr.To(int32(0)),
+					},
+				},
+				pods: []*corev1.Pod{},
+			},
+			want:    map[string]int{},
+			wantErr: false,
+		},
+		{
+			name: "non-pool mode - mixed label and name parsing",
+			args: args{
+				batchSbx: &sandboxv1alpha1.BatchSandbox{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-batch",
+						Namespace: "default",
+					},
+					Spec: sandboxv1alpha1.BatchSandboxSpec{
+						Replicas: ptr.To(int32(3)),
+					},
+				},
+				pods: []*corev1.Pod{
+					{ObjectMeta: metav1.ObjectMeta{
+						Name:   "test-batch-0",
+						Labels: map[string]string{LabelBatchSandboxPodIndexKey: "5"},
+					}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "test-batch-1"}},
+				},
+			},
+			want: map[string]int{
+				"test-batch-0": 5,
+				"test-batch-1": 1,
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := calPodIndex(tt.args.batchSbx, tt.args.pods)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("calPodIndex() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("calPodIndex() = %v, want %v", got, tt.want)
 			}
 		})
 	}
