@@ -37,6 +37,9 @@ func main() {
 	version.EchoVersion()
 
 	flag.InitFlags()
+	if flag.IngressLabelKey == "" || flag.Namespace == "" {
+		log.Panicf("'-ingress-label-key' and/or '-namespace' not set.")
+	}
 
 	cfg := injection.ParseAndGetRESTConfigOrDie()
 	cfg.ContentType = runtime.ContentTypeProtobuf
