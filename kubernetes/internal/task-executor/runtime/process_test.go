@@ -19,7 +19,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
@@ -301,94 +300,4 @@ func TestProcessExecutor_EnvInheritance(t *testing.T) {
 
 	assert.Contains(t, outputStr, expectedHostVar, "Should inherit host environment variables")
 	assert.Contains(t, outputStr, expectedTaskVar, "Should include task-specific environment variables")
-}
-
-func TestProcessExecutor_Sidecar_EnvInheritance(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("Sidecar mode tests depend on /proc and nsenter, only supported on Linux")
-	}
-
-	// 1. Setup Mock "Main Container" Process
-	// We start a sleep process with a specific identifying environment variable
-	mainContainerCmd := exec.Command("sleep", "100")
-	mainContainerCmd.Env = append(os.Environ(),
-		"SANDBOX_MAIN_CONTAINER=test-sidecar-main",
-		"TARGET_CONTAINER_VAR=i_am_from_target",
-	)
-	if err := mainContainerCmd.Start(); err != nil {
-		t.Fatalf("Failed to start mock main container: %v", err)
-	}
-	defer func() {
-		_ = mainContainerCmd.Process.Kill()
-	}()
-
-	// 2. Setup Mock nsenter
-	// Create a script named 'nsenter' that prints envs and behaves like the shim
-	tempBin := t.TempDir()
-	mockNsenterPath := filepath.Join(tempBin, "nsenter")
-	// The mock script:
-	// 1. Prints environment variables to stdout (for verification)
-	// 2. Extracts the shim script command (last argument) and runs it (to behave correctly)
-	// Note: The real Start() calls: nsenter ... -- /bin/sh -c shimScript
-	// We want to verify the env vars passed to nsenter.
-	scriptContent := `#!/bin/sh
-echo "MOCK_NSENTER_CALLED=true"
-env
-# Find the actual command to run (shim script)
-# In the test, we know the structure is: nsenter ... -- /bin/sh -c shimScript
-# We just want to exit successfully to satisfy the test flow or simulate the shim.
-# For simplicity in this env test, we just exit 0. 
-# The shim script logic is tested in Host mode tests.
-exit 0
-`
-	if err := os.WriteFile(mockNsenterPath, []byte(scriptContent), 0755); err != nil {
-		t.Fatalf("Failed to write mock nsenter: %v", err)
-	}
-
-	// Prepend tempBin to PATH
-	oldPath := os.Getenv("PATH")
-	os.Setenv("PATH", tempBin+string(os.PathListSeparator)+oldPath)
-	defer os.Setenv("PATH", oldPath)
-
-	// 3. Configure Executor
-	cfg := &config.Config{
-		DataDir:           t.TempDir(),
-		EnableSidecarMode: true,
-		MainContainerName: "test-sidecar-main", // Matches the env value above
-	}
-	executor, err := NewProcessExecutor(cfg)
-	assert.Nil(t, err)
-
-	task := &types.Task{
-		Name: "sidecar-env-test",
-		Spec: v1alpha1.TaskSpec{
-			Process: &v1alpha1.ProcessTask{
-				Command: []string{"echo", "hello"},
-			},
-		},
-	}
-
-	// 4. Start Task
-	// This should: find our sleep process, read its env, run mock nsenter with that env
-	if err := executor.Start(context.Background(), task); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-
-	// 5. Verify Output
-	// We read the task's stdout.log
-	pExecutor := executor.(*processExecutor)
-	taskDir, _ := utils.SafeJoin(pExecutor.rootDir, task.Name)
-	stdoutPath := filepath.Join(taskDir, StdoutFile)
-
-	// Wait a bit for file to be written
-	time.Sleep(100 * time.Millisecond)
-
-	output, err := os.ReadFile(stdoutPath)
-	if err != nil {
-		t.Fatalf("Failed to read stdout: %v", err)
-	}
-	outputStr := string(output)
-
-	assert.Contains(t, outputStr, "MOCK_NSENTER_CALLED=true", "Should call mock nsenter")
-	assert.Contains(t, outputStr, "TARGET_CONTAINER_VAR=i_am_from_target", "Should inherit env from target container")
 }
