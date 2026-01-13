@@ -50,7 +50,6 @@ import (
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/expectations"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/fieldindex"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/requeueduration"
-	api "github.com/alibaba/OpenSandbox/sandbox-k8s/pkg/task-executor"
 )
 
 var (
@@ -193,7 +192,8 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// task schedule
-	if batchSbx.Spec.TaskTemplate != nil {
+	taskStrategy := NewTaskSchedulingStrategy(batchSbx)
+	if taskStrategy.NeedTaskScheduling(batchSbx) {
 		// Because tasks are in-memory and there is no event mechanism, periodic reconciliation is required.
 		DurationStore.Push(types.NamespacedName{Namespace: batchSbx.Namespace, Name: batchSbx.Name}.String(), 3*time.Second)
 		sch, err := r.getTaskScheduler(batchSbx, pods)
@@ -321,7 +321,8 @@ func (r *BatchSandboxReconciler) getTaskScheduler(batchSbx *sandboxv1alpha1.Batc
 		if batchSbx.Spec.TaskResourcePolicyWhenCompleted != nil {
 			policy = *batchSbx.Spec.TaskResourcePolicyWhenCompleted
 		}
-		taskSpecs, err := generaTaskSpec(batchSbx)
+		taskStrategy := NewTaskSchedulingStrategy(batchSbx)
+		taskSpecs, err := taskStrategy.GenerateTaskSpecs(batchSbx)
 		if err != nil {
 			return nil, err
 		}
@@ -347,52 +348,6 @@ func (r *BatchSandboxReconciler) deleteTaskScheduler(batchSbx *sandboxv1alpha1.B
 	klog.Infof("delete task scheduler for batch sandbox %s", klog.KObj(batchSbx))
 	key := types.NamespacedName{Namespace: batchSbx.Namespace, Name: batchSbx.Name}.String()
 	r.taskSchedulers.Delete(key)
-}
-
-func generaTaskSpec(batchSbx *sandboxv1alpha1.BatchSandbox) ([]*api.Task, error) {
-	ret := make([]*api.Task, *batchSbx.Spec.Replicas)
-	for idx := range int(*batchSbx.Spec.Replicas) {
-		task, err := getTaskSpec(batchSbx, idx)
-		if err != nil {
-			return ret, err
-		}
-		ret[idx] = task
-	}
-	return ret, nil
-}
-
-// TODO: Consider handling container task dispatch with template & shardPatches under resource acceleration mode
-func getTaskSpec(batchSbx *sandboxv1alpha1.BatchSandbox, idx int) (*api.Task, error) {
-	task := &api.Task{
-		Name: fmt.Sprintf("%s-%d", batchSbx.Name, idx),
-	}
-	if len(batchSbx.Spec.ShardTaskPatches) > 0 && idx < len(batchSbx.Spec.ShardTaskPatches) {
-		taskTemplate := batchSbx.Spec.TaskTemplate.DeepCopy()
-		cloneBytes, _ := json.Marshal(taskTemplate)
-		patch := batchSbx.Spec.ShardTaskPatches[idx]
-		modified, err := strategicpatch.StrategicMergePatch(cloneBytes, patch.Raw, &sandboxv1alpha1.TaskTemplateSpec{})
-		if err != nil {
-			return nil, fmt.Errorf("batchsandbox: failed to merge patch raw %s, idx %d, err %w", patch.Raw, idx, err)
-		}
-		newTaskTemplate := &sandboxv1alpha1.TaskTemplateSpec{}
-		if err = json.Unmarshal(modified, newTaskTemplate); err != nil {
-			return nil, fmt.Errorf("batchsandbox: failed to unmarshal %s to TaskTemplateSpec, idx %d, err %w", modified, idx, err)
-		}
-		task.Process = &api.Process{
-			Command:    newTaskTemplate.Spec.Process.Command,
-			Args:       newTaskTemplate.Spec.Process.Args,
-			Env:        newTaskTemplate.Spec.Process.Env,
-			WorkingDir: newTaskTemplate.Spec.Process.WorkingDir,
-		}
-	} else if batchSbx.Spec.TaskTemplate != nil && batchSbx.Spec.TaskTemplate.Spec.Process != nil {
-		task.Process = &api.Process{
-			Command:    batchSbx.Spec.TaskTemplate.Spec.Process.Command,
-			Args:       batchSbx.Spec.TaskTemplate.Spec.Process.Args,
-			Env:        batchSbx.Spec.TaskTemplate.Spec.Process.Env,
-			WorkingDir: batchSbx.Spec.TaskTemplate.Spec.Process.WorkingDir,
-		}
-	}
-	return task, nil
 }
 
 func (r *BatchSandboxReconciler) scheduleTasks(ctx context.Context, tSch taskscheduler.TaskScheduler, batchSbx *sandboxv1alpha1.BatchSandbox) error {
