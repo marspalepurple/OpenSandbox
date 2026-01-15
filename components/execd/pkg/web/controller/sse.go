@@ -32,11 +32,13 @@ import (
 var sseHeaders = map[string]string{
 	"Content-Type":      "text/event-stream",
 	"Cache-Control":     "no-cache",
-	"Connection":        "keep-alive",
+	"Connection":        "close",
 	"X-Accel-Buffering": "no",
 }
 
 func (c *basicController) setupSSEResponse() {
+	// Ensure this connection won't be reused after SSE completes.
+	c.ctx.Request.Close = true
 	for key, value := range sseHeaders {
 		c.ctx.Writer.Header().Set(key, value)
 	}

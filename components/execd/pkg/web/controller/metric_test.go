@@ -92,7 +92,7 @@ func TestWatchMetricsHeaders(t *testing.T) {
 	assert.Equal(t, "no-cache", cacheControl)
 
 	connection := w.Header().Get("Connection")
-	assert.Equal(t, "keep-alive", connection)
+	assert.Equal(t, "close", connection)
 
 	buffering := w.Header().Get("X-Accel-Buffering")
 	assert.Equal(t, "no", buffering)
