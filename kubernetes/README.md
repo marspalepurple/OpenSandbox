@@ -42,14 +42,71 @@ Intelligent resource management features:
 - Pool-wide capacity limits to prevent resource exhaustion
 - Automatic scaling based on demand
 
+
+## Relationship with [kubernates-sigs/agent-sandbox](kubernates-sigs/agent-sandbox)
+
+BatchSandbox does not duplicate the basic functionality of Agent-Sandbox, but rather complements it with additional enhanced capabilities:
+
+1. **Batch Sandbox Semantics**: Significantly improves Sandbox delivery throughput in scenarios such as Reinforcement Learning (RL) training
+2. **Task Scheduling Capability**: Enables differentiated Sandbox delivery through Task scheduling, such as injecting custom processes into containers before Sandbox delivery
+
+Therefore, you can choose the appropriate project as your Sandbox underlying runtime based on your specific application scenarios.
+
+### Performance Testing
+
+Performance comparison test of BatchSandbox and Sig Agent-Sandbox in terms of throughput.
+
+**Test Environment**
+
+**Controller Component Configuration**
+- Resource Specifications: request: 12C32G, limit: 16C64G
+- Concurrency Configuration:
+  - **Sig Agent-Sandbox**: 3 controllers (sandbox, sandboxclaim, sandboxwarmppool), no concurrency configuration provided in the code, default value is 1
+  - **BatchSandbox**: 2 controllers, batchsandbox controller concurrency is 32, pool controller concurrency is 1
+
+**Pool Configuration**
+- Image: busybox:latest
+- Resource Specifications: 0.1C256MB
+
+> **Additional Note**: Although the batchsandbox-controller of BatchSandbox has a concurrency of 32, only one BatchSandbox object was created in the test cases, which is actually equivalent to a concurrency of 1. Therefore, in terms of concurrency, BatchSandbox is consistent with SIG Agent-Sandbox.
+
+**Performance Comparison Results**
+
+When both use resource pools, the total time comparison for delivering 100 Sandboxes:
+
+| Test Scenario | Total Time (seconds) |
+|---------------|---------------------|
+| SIG Agent-Sandbox (concurrency=1) | 76.35 |
+| SIG Agent-Sandbox (concurrency=10) | 23.17 |
+| SIG Agent-Sandbox (concurrency=50) | 33.85 |
+| BatchSandbox | 0.92 |
+
+**Analysis**
+
+Core Difference: The time complexity of Sig Agent-Sandbox and BatchSandbox for batch delivery of N Sandboxes is O(N) and O(1) respectively.
+
+**Sig Agent-Sandbox Architecture**
+- Each Sandbox delivery process requires the following write operations (total write operations are proportional to Sandbox scale):
+  1. Create a SandboxClaim
+  2. Create a Sandbox
+  3. Update Pod once (adopt Pod from resource pool)
+  4. Update Sandbox Status once
+  5. Update SandboxClaim Status once
+
+**BatchSandbox Architecture**
+- Each batch Sandbox delivery process requires the following write operations (total write operations are independent of Sandbox scale):
+  1. Create a BatchSandbox
+  2. Update BatchSandbox annotation once (write batch allocation results)
+  3. Update BatchSandbox status once
+
 ## Getting Started
 ![](images/deploy-example.gif)
 
 ### Prerequisites
 - go version v1.24.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.22.4+ cluster.
+- docker version 17.03+
+- kubectl version v1.11.3+
+- Access to a Kubernetes v1.22.4+ cluster
 
 If you don't have access to a Kubernetes cluster, you can use [kind](https://kind.sigs.k8s.io/) to create a local Kubernetes cluster for testing purposes. Kind runs Kubernetes nodes in Docker containers, making it easy to set up a local development environment.
 
