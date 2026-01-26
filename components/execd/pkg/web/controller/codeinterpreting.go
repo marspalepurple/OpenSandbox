@@ -108,7 +108,7 @@ func (c *CodeInterpretingController) RunCode() {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(c.ctx.Request.Context())
 	defer cancel()
 	runCodeRequest := c.buildExecuteCodeRequest(request)
 	eventsHandler := c.setServerEventsHandler(ctx)

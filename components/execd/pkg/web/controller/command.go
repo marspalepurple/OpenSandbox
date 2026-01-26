@@ -48,7 +48,7 @@ func (c *CodeInterpretingController) RunCommand() {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(c.ctx.Request.Context())
 	defer cancel()
 
 	runCodeRequest := c.buildExecuteCommandRequest(request)
